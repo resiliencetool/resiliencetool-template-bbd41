@@ -1,95 +1,155 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ResilienceTool — First-Time Setup</title>
-  <meta charset="utf-8">
-  <style>
-    body{font-family:Arial,sans-serif;background:#f4f4f4;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
-    .card{background:#fff;padding:32px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:90%;max-width:380px;box-sizing:border-box;}
-    .brandRow{display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:18px;}
-    .brandName{font-size:19px;font-weight:700;color:#132869;}
-    h2{margin-top:0;font-size:18px;color:#333;text-align:center;}
-    p{font-size:14px;color:#666;line-height:1.5;text-align:center;}
-    label{font-size:13px;font-weight:600;color:#333;}
-    input{width:100%;padding:10px;margin-top:6px;margin-bottom:16px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;}
-    button{width:100%;padding:12px;background:#132869;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;}
-    button:disabled{opacity:0.6;cursor:default;}
-    #message{margin-top:12px;font-size:14px;color:#b00020;text-align:center;}
-    #successMessage{margin-top:12px;font-size:14px;color:#1e8449;text-align:center;display:none;}
-  </style>
-</head>
-<body>
-<div class="card">
-  <div class="brandRow">
-    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M12 2L4 5V11C4 16 7.5 20 12 22C16.5 20 20 16 20 11V5L12 2Z" fill="#132869"/>
-      <rect x="8" y="9" width="8" height="1.4" rx="0.7" fill="#fff"/>
-      <rect x="8" y="12" width="8" height="1.4" rx="0.7" fill="#fff"/>
-      <rect x="8" y="15" width="5" height="1.4" rx="0.7" fill="#fff"/>
-    </svg>
-    <span class="brandName">ResilienceTool</span>
-  </div>
-  <h2>Finish Setting Up</h2>
-  <p>This runs once, to create your company and your login. You can customise your branding later from your dashboard.</p>
+// Runs once per instance, entirely self-contained — creates the
+// company row and the first adviser (the person setting up), then
+// sends them the exact same invite email every other adviser gets.
+// They set their password through dashboard-login.html's existing
+// "Set Your Password" flow — nothing new needed there.
+//
+// Deliberately refuses to run a second time (see the guard below),
+// since this instance is single-tenant — it should only ever have
+// one company.
 
-  <div id="formArea">
-    <label for="companyName">Company name</label>
-    <input id="companyName" type="text" placeholder="Your company name">
-    <label for="ownerName">Your name</label>
-    <input id="ownerName" type="text" placeholder="Jane Smith">
-    <label for="ownerEmail">Your email</label>
-    <input id="ownerEmail" type="email" placeholder="jane@yourcompany.co.uk">
-    <button id="submitBtn">Create My Account</button>
-  </div>
+const { createClient } = require("@supabase/supabase-js");
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-  <div id="message"></div>
-  <div id="successMessage"></div>
-</div>
-<script>
-document.getElementById("submitBtn").addEventListener("click", async function(){
-  const message = document.getElementById("message");
-  const successMessage = document.getElementById("successMessage");
-  const button = document.getElementById("submitBtn");
-  message.textContent = "";
+function slugify(text){
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+}
 
-  const companyName = document.getElementById("companyName").value.trim();
-  const ownerName = document.getElementById("ownerName").value.trim();
-  const ownerEmail = document.getElementById("ownerEmail").value.trim();
-
-  if(!companyName || !ownerName || !ownerEmail){
-    message.textContent = "Please fill in all three fields.";
-    return;
+exports.handler = async function(event, context){
+  if(event.httpMethod !== "POST"){
+    return { statusCode: 405, body: JSON.stringify({ error: "Method not allowed" }) };
   }
-
-  button.disabled = true;
-  button.textContent = "Setting up...";
 
   try {
-    const res = await fetch("/.netlify/functions/first-time-setup", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ companyName, ownerName, ownerEmail })
-    });
-    const data = await res.json();
+    const body = JSON.parse(event.body || "{}");
+    const { companyName, ownerName, ownerEmail } = body;
 
-    if(!res.ok){
-      message.textContent = data.error || "Something went wrong. Please try again.";
-      button.disabled = false;
-      button.textContent = "Create My Account";
-      return;
+    if(!companyName || !ownerName || !ownerEmail){
+      return { statusCode: 400, body: JSON.stringify({ error: "Company name, your name, and your email are all required" }) };
     }
 
-    document.getElementById("formArea").style.display = "none";
-    successMessage.style.display = "block";
-    successMessage.textContent = "Check your email (" + ownerEmail + ") for a link to set your password and log in.";
+    // Guard against a second company existing in this single-tenant
+    // instance — but allow a genuine mistake (wrong email, typo'd
+    // company name) to be corrected freely, right up until someone has
+    // actually confirmed their invite and logged in for real. Once
+    // that's happened, this locks permanently — a live company should
+    // never be silently wiped.
+    const { data: existingCompanies, error: fetchError } = await supabaseAdmin
+      .from("companies")
+      .select("id");
+
+    if(fetchError){
+      return { statusCode: 500, body: JSON.stringify({ error: fetchError.message }) };
+    }
+
+    if(existingCompanies && existingCompanies.length > 0){
+      const existingCompanyId = existingCompanies[0].id;
+
+      const { data: existingAdvisers, error: advisersFetchError } = await supabaseAdmin
+        .from("advisers")
+        .select("id, auth_user_id")
+        .eq("company_id", existingCompanyId);
+
+      if(advisersFetchError){
+        return { statusCode: 500, body: JSON.stringify({ error: advisersFetchError.message }) };
+      }
+
+      let anyoneHasLoggedIn = false;
+      for(const adviser of (existingAdvisers || [])){
+        if(!adviser.auth_user_id) continue;
+        const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(adviser.auth_user_id);
+        // last_sign_in_at is only ever set after a genuine successful
+        // sign-in — unlike email_confirmed_at, which Supabase sets the
+        // moment an invite link is clicked, even if the person then
+        // fails to actually set a password and never gets in.
+        if(authUser?.user?.last_sign_in_at){
+          anyoneHasLoggedIn = true;
+          break;
+        }
+      }
+
+      if(anyoneHasLoggedIn){
+        return { statusCode: 409, body: JSON.stringify({ error: "Setup has already been completed for this instance. Please log in instead." }) };
+      }
+
+      // Nobody has confirmed yet — safe to treat this as a redo. Clean
+      // up the unconfirmed draft before creating the corrected version.
+      for(const adviser of (existingAdvisers || [])){
+        if(adviser.auth_user_id){
+          await supabaseAdmin.auth.admin.deleteUser(adviser.auth_user_id);
+        }
+      }
+      await supabaseAdmin.from("advisers").delete().eq("company_id", existingCompanyId);
+      await supabaseAdmin.from("companies").delete().eq("id", existingCompanyId);
+    }
+
+    const companySlug = slugify(companyName);
+
+    const { data: newCompany, error: companyError } = await supabaseAdmin
+      .from("companies")
+      .insert({
+        company_name: companyName,
+        company_slug: companySlug,
+        company_email: ownerEmail,
+        primary_colour: "#132869",
+        secondary_colour: "#e8edf7",
+        active: true
+      })
+      .select()
+      .single();
+
+    if(companyError){
+      return { statusCode: 500, body: JSON.stringify({ error: companyError.message }) };
+    }
+
+    const ownerSlug = slugify(ownerName);
+
+    const { data: newAdviser, error: adviserError } = await supabaseAdmin
+      .from("advisers")
+      .insert({
+        adviser_name: ownerName,
+        adviser_email: ownerEmail,
+        adviser_slug: ownerSlug,
+        company_id: newCompany.id,
+        active: true,
+        invite_status: "pending"
+      })
+      .select()
+      .single();
+
+    if(adviserError){
+      // Roll back the company row rather than leave an orphaned company
+      // with no adviser — a clean failure is better than a half-created
+      // instance someone has to spot and fix manually later.
+      await supabaseAdmin.from("companies").delete().eq("id", newCompany.id);
+      return { statusCode: 500, body: JSON.stringify({ error: adviserError.message }) };
+    }
+
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.inviteUserByEmail(ownerEmail);
+    const newStatus = authError ? "failed" : "sent";
+    if(authError){
+      console.error("Invite failed for", ownerEmail, authError);
+    }
+
+    await supabaseAdmin
+      .from("advisers")
+      .update({
+        invite_status: newStatus,
+        auth_user_id: authData?.user?.id || null
+      })
+      .eq("id", newAdviser.id);
+
+    return { statusCode: 200, body: JSON.stringify({ success: true, inviteStatus: newStatus }) };
 
   } catch(err){
-    message.textContent = "Could not reach the server. Please try again.";
-    button.disabled = false;
-    button.textContent = "Create My Account";
+    console.error("first-time-setup error:", err);
+    return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
   }
-});
-</script>
-</body>
-</html>
+};
